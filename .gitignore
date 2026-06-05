@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+.venv.broken/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# SAM 2 upstream clone: nested git repo + large checkpoints (~GB).
+# Clone separately: https://github.com/facebookresearch/sam2
+sam2_repo/
