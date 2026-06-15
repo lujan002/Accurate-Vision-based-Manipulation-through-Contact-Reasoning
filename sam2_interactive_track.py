@@ -4,9 +4,12 @@ Interactive SAM2 perception demo aligned with contact_reasoning perception plan.
 
 - Sources: webcam, video file (.mp4), JPEG folder, optional RealSense (if pyrealsense2 installed).
 - SAM2VideoPredictor + temporal memory for file / directory sources (full forward propagate after lock).
-- Webcam / RealSense stream: centroid + ``SAM2ImagePredictor`` each frame. Updates are gated so the
-  mask stays tied to the **first locked** region (anchor overlap + temporal IoU + centroid motion cap);
-  bad jumps fall back to the last good mask. Press **``r``** for a full GUI reprompt.
+- Webcam / RealSense stream: ``SAM2VideoPredictor`` with an in-memory frame buffer — each new frame is
+  appended, then ``propagate_in_video`` runs for that index only so mask memory carries across frames.
+  Optional ``--stream-video-state-cap`` re-anchors with ``add_new_mask`` to cap GPU memory on long runs.
+  Locking still uses ``SAM2ImagePredictor`` multimasks from your click. Press **``r``** for a full reprompt.
+  **Temporal memory:** later frames are conditioned via encoded memory from past frames (not by feeding the
+  previous binary mask as a direct ``mask_input`` each tick the way the image predictor can).
 
 ``--preview event_only`` : for **webcam / RealSense** while **TRACKING**, the **overlay** refreshes only when
   you press **Space** (tracking still runs every frame so Space samples the latest mask). Ignored for
@@ -14,9 +17,14 @@ Interactive SAM2 perception demo aligned with contact_reasoning perception plan.
 
 Space  : manipulation timestep (stub pose / EKF log). In ``event_only`` + **TRACKING** (stream sources),
   also publishes the latest mask to the display overlay.
-Enter  : confirm mask during locking / reprompt.
-, . or Left/Right arrows : cycle top-3 masks.
-r      : force full reprompt.
+**Default** ``--lock-on click``: one left-click runs multimask then **locks the top mask and starts tracking**
+  immediately. ``--lock-on enter``: click only sets the point; use ``,`` / ``.`` or Left/Right arrows to cycle
+  the top-3 masks, then **Enter** to lock. **Left-click while tracking** (webcam / RealSense) discards stream
+  memory and re-picks the same way (click vs enter applies to that repick too).
+r      : force full reprompt (clears file + stream state).
+
+``--preview live`` / ``auto`` : overlay follows ``mask_disp`` every frame. ``event_only`` freezes the
+  overlay until **Space** (tracking still runs in the background).
 ESC / q: quit.
 
 Run from the ``contact_reasoning`` directory (same as ``sam2_test_img.py``). Do not modify ``sam2_test_img.py``.
@@ -27,10 +35,10 @@ If ``import torch`` seems to hang or errors under ``.../torch/distributed/_pycut
 slow or power-managed USB drive: move the project/venv to an internal SSD, or set e.g.
 ``export PYTHONPYCACHEPREFIX=/tmp/sam2_pyc`` so bytecode is not written to the USB volume, then retry.
 
-**Webcam fast motion:** tracking is centroid + image SAM each frame (no temporal memory), so very fast motion
-can still lose lock. Use ``--webcam-buffer 1`` (default), optional ``--webcam-fps`` / ``--webcam-width`` /
-``--webcam-height``, ``--webcam-flush-grabs`` to reduce capture backlog, and ``--stream-motion fast`` to relax
-stability gates. Effective FPS is usually capped by SAM inference time, not only the camera.
+**Webcam performance:** temporal memory costs more per frame than the old centroid+image path. Use
+``--webcam-buffer 1`` (default), optional ``--webcam-fps`` / ``--webcam-width`` / ``--webcam-height``,
+``--webcam-flush-grabs`` to reduce backlog, and tune ``--stream-video-state-cap`` (lower cap = more frequent
+re-anchor, less GPU RAM for the frame tensor stack). Effective FPS is usually capped by SAM inference time.
 """
 
 from __future__ import annotations
@@ -51,10 +59,12 @@ import glob
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 print("Loading PyTorch and SAM2 (first run can be slow on USB/external disks; wait or use SSD)…", flush=True)
 try:
@@ -75,6 +85,78 @@ except KeyboardInterrupt:
     ) from None
 
 OBJ_ID = 1
+
+
+@contextmanager
+def _silence_sam2_video_tqdm() -> Iterator[None]:
+    """Patch tqdm in ``sam2_video_predictor`` (env ``TQDM_DISABLE`` is often applied too late)."""
+    import sam2.sam2_video_predictor as _s2vp
+
+    _orig = _s2vp.tqdm
+
+    def _quiet(iterable, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return iterable
+
+    _s2vp.tqdm = _quiet  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        _s2vp.tqdm = _orig
+
+
+def rgb_hwc_uint8_to_sam2_image_tensor(
+    rgb: np.ndarray,
+    image_size: int,
+    compute_device: torch.device,
+    offload_video_to_cpu: bool,
+) -> torch.Tensor:
+    """One RGB frame -> (3, image_size, image_size) float32, ImageNet-normalized (same as ``load_video_frames``)."""
+    assert rgb.ndim == 3 and rgb.shape[2] == 3
+    img = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    t = torch.from_numpy(img).permute(2, 0, 1).contiguous().float() / 255.0
+    storage = torch.device("cpu") if offload_video_to_cpu else compute_device
+    t = t.to(storage)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=storage)[:, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=storage)[:, None, None]
+    return (t - mean) / std
+
+
+def init_video_state_from_images_tensor(
+    predictor: SAM2VideoPredictor,
+    images: torch.Tensor,
+    video_height: int,
+    video_width: int,
+    offload_video_to_cpu: bool,
+    offload_state_to_cpu: bool,
+) -> Dict[str, Any]:
+    """
+    Same structure as ``SAM2VideoPredictor.init_state`` but ``images`` is already normalized
+    ``(T, 3, image_size, image_size)`` for streaming / in-memory clips.
+    """
+    compute_device = predictor.device
+    inference_state: Dict[str, Any] = {}
+    inference_state["images"] = images
+    inference_state["num_frames"] = int(images.shape[0])
+    inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+    inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+    inference_state["video_height"] = int(video_height)
+    inference_state["video_width"] = int(video_width)
+    inference_state["device"] = compute_device
+    inference_state["storage_device"] = (
+        torch.device("cpu") if offload_state_to_cpu else compute_device
+    )
+    inference_state["point_inputs_per_obj"] = {}
+    inference_state["mask_inputs_per_obj"] = {}
+    inference_state["cached_features"] = {}
+    inference_state["constants"] = {}
+    inference_state["obj_id_to_idx"] = OrderedDict()
+    inference_state["obj_idx_to_id"] = OrderedDict()
+    inference_state["obj_ids"] = []
+    inference_state["output_dict_per_obj"] = {}
+    inference_state["temp_output_dict_per_obj"] = {}
+    inference_state["frames_tracked_per_obj"] = {}
+    predictor._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+    return inference_state
 
 
 class LockState(Enum):
@@ -127,6 +209,16 @@ def _mask_centroid(mask: np.ndarray) -> Optional[Tuple[float, float]]:
         return None
     ys, xs = np.where(m)
     return float(xs.mean()), float(ys.mean())
+
+
+def mask_to_shape_hw(mask: Optional[np.ndarray], h: int, w: int) -> np.ndarray:
+    """Boolean mask resized to (h, w) for compositing on the current RGB frame."""
+    if mask is None:
+        return np.zeros((h, w), dtype=bool)
+    m = mask.astype(bool)
+    if m.shape == (h, w):
+        return m
+    return (cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5).astype(bool)
 
 
 def overlay_mask_bgr(
@@ -335,10 +427,18 @@ class InteractiveSession:
     video_inference_state: Optional[dict] = None
     video_masks_by_frame: Optional[Dict[int, np.ndarray]] = None
     video_frame_count: int = 0
+    # Webcam / RealSense: SAM2VideoPredictor state built from an in-memory tensor clip (append per frame).
+    stream_video_state: Optional[Dict[str, Any]] = None
+    stream_video_state_cap: int = 360
+    stream_video_offload_video: bool = False
+    stream_video_offload_state: bool = False
+    # If >0, log timing / mask stats every N SAM2 stream propagates (counts attempts, not only successes).
+    stream_diag_every: int = 0
+    stream_diag_prop_count: int = 0
     file_frame_index: int = 0
     last_bgr_display: Optional[np.ndarray] = None
 
-    # Stream (webcam / realsense): frozen copy of the mask at Enter — gates new predictions.
+    # Stream (webcam / realsense): frozen copy of the mask at lock — gates new predictions.
     anchor_mask: Optional[np.ndarray] = None
     # event_only + TRACKING: mask drawn until the next Space (tracking still updates locked_mask).
     event_only_overlay_mask: Optional[np.ndarray] = None
@@ -346,14 +446,28 @@ class InteractiveSession:
 
     # After lock, skip one IoU check so we do not compare centroid refinement to the multimask.
     _skip_iou_once: bool = False
-    # Webcam/realsense: first TRACKING frame only redraws locked mask (no centroid predict) to avoid
-    # immediate begin_reprompt() when the first refine fails health vs the GUI-chosen mask.
-    _stream_display_locked_only_once: bool = False
 
     def __post_init__(self) -> None:
         self._maybe_autocast = nullcontext()
         if self.device.type == "cuda":
             self._maybe_autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+
+    def begin_stream_click_repick(self, x: int, y: int) -> None:
+        """Webcam/RealSense: new click during TRACKING — discard stream memory and pick a fresh point."""
+        self.stream_video_state = None
+        self.lock_state = LockState.NEED_CLICK
+        self.pending_click_xy = (int(x), int(y))
+        self.candidate_masks = None
+        self.candidate_scores = None
+        self.lock_prompt_pts = None
+        self.lock_prompt_labels = None
+        self.locked_mask = None
+        self.prev_mask = None
+        self.anchor_mask = None
+        self.event_only_overlay_mask = None
+        self._skip_iou_once = False
+        self._stream_stability_ticks = 0
+        self.stream_diag_prop_count = 0
 
     def begin_reprompt(self) -> None:
         self.lock_state = LockState.NEED_CLICK
@@ -366,10 +480,11 @@ class InteractiveSession:
         self.prev_mask = None
         self.video_masks_by_frame = None
         self._skip_iou_once = False
-        self._stream_display_locked_only_once = False
         self.anchor_mask = None
         self.event_only_overlay_mask = None
         self._stream_stability_ticks = 0
+        self.stream_video_state = None
+        self.stream_diag_prop_count = 0
 
     def reset_video_file_state(self, video_path: str) -> None:
         with torch.inference_mode(), self._maybe_autocast:
@@ -427,6 +542,88 @@ class InteractiveSession:
                     cv2.waitKey(1)
         self.video_masks_by_frame = masks
 
+    def init_stream_video_from_lock(
+        self,
+        rgb: np.ndarray,
+        points_xy: np.ndarray,
+        labels: np.ndarray,
+    ) -> None:
+        """After multimask lock: one-frame video state + points on frame 0 + propagate (SAM2 memory seed)."""
+        h, w = rgb.shape[:2]
+        sz = int(self.video_predictor.image_size)
+        offload_v = self.stream_video_offload_video
+        batch = rgb_hwc_uint8_to_sam2_image_tensor(rgb, sz, self.device, offload_v).unsqueeze(0)
+        with torch.inference_mode(), self._maybe_autocast:
+            self.stream_video_state = init_video_state_from_images_tensor(
+                self.video_predictor,
+                batch,
+                video_height=h,
+                video_width=w,
+                offload_video_to_cpu=offload_v,
+                offload_state_to_cpu=self.stream_video_offload_state,
+            )
+            self.video_predictor.add_new_points_or_box(
+                self.stream_video_state,
+                frame_idx=0,
+                obj_id=OBJ_ID,
+                points=torch.as_tensor(points_xy, dtype=torch.float32),
+                labels=torch.as_tensor(labels, dtype=torch.int32),
+                clear_old_points=True,
+                normalize_coords=True,
+                box=None,
+            )
+            last_mask: Optional[np.ndarray] = None
+            with _silence_sam2_video_tqdm():
+                for _f_idx, _obj_ids, video_res_masks in self.video_predictor.propagate_in_video(
+                    self.stream_video_state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=1,
+                    reverse=False,
+                ):
+                    last_mask = video_res_masks[0, 0].detach().cpu().numpy() > 0.5
+        if last_mask is not None:
+            self.locked_mask = mask_to_shape_hw(last_mask.astype(bool), h, w)
+            self.anchor_mask = self.locked_mask.copy()
+
+    def _stream_video_reanchor(self, rgb: np.ndarray) -> None:
+        """Re-init clip with current RGB + last mask (``add_new_mask``) when frame buffer hits cap."""
+        if self.locked_mask is None:
+            return
+        h, w = rgb.shape[:2]
+        mask = self.locked_mask
+        if mask.shape != (h, w):
+            mask = (cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5)
+        sz = int(self.video_predictor.image_size)
+        offload_v = self.stream_video_offload_video
+        batch = rgb_hwc_uint8_to_sam2_image_tensor(rgb, sz, self.device, offload_v).unsqueeze(0)
+        with torch.inference_mode(), self._maybe_autocast:
+            self.stream_video_state = init_video_state_from_images_tensor(
+                self.video_predictor,
+                batch,
+                video_height=h,
+                video_width=w,
+                offload_video_to_cpu=offload_v,
+                offload_state_to_cpu=self.stream_video_offload_state,
+            )
+            self.video_predictor.add_new_mask(
+                self.stream_video_state,
+                frame_idx=0,
+                obj_id=OBJ_ID,
+                mask=torch.as_tensor(mask, dtype=torch.bool),
+            )
+            last_mask: Optional[np.ndarray] = None
+            with _silence_sam2_video_tqdm():
+                for _f_idx, _obj_ids, video_res_masks in self.video_predictor.propagate_in_video(
+                    self.stream_video_state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=1,
+                    reverse=False,
+                ):
+                    last_mask = video_res_masks[0, 0].detach().cpu().numpy() > 0.5
+        if last_mask is not None:
+            self.locked_mask = mask_to_shape_hw(last_mask.astype(bool), h, w)
+        self.prev_mask = None
+
     def image_reprompt_multimask(self, rgb: np.ndarray, points_xy: np.ndarray, labels: np.ndarray) -> None:
         with torch.inference_mode(), self._maybe_autocast:
             self.image_predictor.set_image(rgb)
@@ -448,6 +645,55 @@ class InteractiveSession:
         if self.candidate_masks is None:
             return None
         return self.candidate_masks[self.multimask_idx]
+
+    def finalize_multimask_lock(
+        self,
+        rgb: np.ndarray,
+        h: int,
+        w: int,
+        *,
+        event_only: bool,
+        source: str,
+        video_disk_path: Optional[str],
+        frame_source: FrameSource,
+        progress_win: str,
+    ) -> bool:
+        """Apply the current multimask as ``locked_mask`` and start file/stream tracking."""
+        self.locked_mask = self.current_chosen_mask()
+        if self.locked_mask is None:
+            return False
+        self.prev_mask = None
+        self.lock_state = LockState.TRACKING
+        self.candidate_masks = None
+        self.candidate_scores = None
+        self.anchor_mask = self.locked_mask.astype(bool).copy()
+        self._stream_stability_ticks = 0
+        if event_only and source in ("webcam", "realsense"):
+            lm = self.locked_mask.astype(bool)
+            if lm.shape != (h, w):
+                lm = (cv2.resize(lm.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5)
+            self.event_only_overlay_mask = lm.astype(bool)
+        else:
+            self.event_only_overlay_mask = None
+        self._skip_iou_once = True
+        if source in ("webcam", "realsense"):
+            if self.lock_prompt_pts is not None and self.lock_prompt_labels is not None:
+                self.init_stream_video_from_lock(rgb, self.lock_prompt_pts, self.lock_prompt_labels)
+        if video_disk_path is not None and self.lock_prompt_pts is not None:
+            logging.info("Video propagate on %s …", video_disk_path)
+            self.reset_video_file_state(video_disk_path)
+            bgr_snap = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            self.run_full_propagation_file(
+                0,
+                self.lock_prompt_pts,
+                self.lock_prompt_labels,
+                progress_win=progress_win,
+                progress_bgr=bgr_snap,
+            )
+            self.file_frame_index = 0
+            _sync_file_frame(frame_source, 0)
+        logging.info("Mask locked; tracking.")
+        return True
 
     def tracking_health_ok(self, mask: np.ndarray, iou_ref: Optional[np.ndarray] = None) -> bool:
         """iou_ref: previous accepted mask for IoU; None skips IoU (e.g. first frame after lock)."""
@@ -516,12 +762,62 @@ class InteractiveSession:
 
         return True
 
+    def _stream_diag_log_propagate(
+        self,
+        st: Dict[str, Any],
+        prop_ms: float,
+        last_mask: Optional[np.ndarray],
+        h: int,
+        w: int,
+        prev_locked: Optional[np.ndarray],
+        err: Optional[str],
+    ) -> None:
+        """Periodic INFO log for webcam stream propagates (attempt-based, not success-only)."""
+        if self.stream_diag_every <= 0:
+            return
+        self.stream_diag_prop_count += 1
+        if self.stream_diag_prop_count % self.stream_diag_every != 0:
+            return
+        buf = int(st.get("num_frames", -1))
+        if err is not None:
+            logging.info(
+                "stream_diag attempt=%s buf_frames=%s prop_ms=%.1f status=ERROR %s",
+                self.stream_diag_prop_count,
+                buf,
+                prop_ms,
+                err,
+            )
+            return
+        has_m = last_mask is not None and bool(last_mask.any())
+        if has_m and last_mask is not None:
+            tmp = mask_to_shape_hw(last_mask.astype(bool), h, w)
+            mf = float(tmp.mean())
+            iou = (
+                _mask_iou(tmp, prev_locked)
+                if prev_locked is not None and prev_locked.shape == tmp.shape
+                else -1.0
+            )
+        else:
+            mf = 0.0
+            iou = -1.0
+        logging.info(
+            "stream_diag attempt=%s buf_frames=%s prop_ms=%.1f has_mask=%d mask_frac=%.4f iou_vs_prev=%.4f",
+            self.stream_diag_prop_count,
+            buf,
+            prop_ms,
+            int(has_m),
+            mf,
+            iou,
+        )
+
     def on_tracking_tick_stream(self, rgb: np.ndarray) -> np.ndarray:
-        """Centroid + image predictor between frames. Never calls begin_reprompt: single-point
-        re-segmentation is unreliable; keep the last locked mask on failure and use ``r`` to re-pick."""
+        """Append the new frame to the in-memory clip and run ``propagate_in_video`` for that index only."""
         h, w = rgb.shape[:2]
         if self.locked_mask is None:
             return np.zeros((h, w), dtype=bool)
+        if self.stream_video_state is None:
+            logging.warning("stream SAM2 video: missing stream_video_state; holding last mask")
+            return self.locked_mask.copy()
         if self.locked_mask.shape != (h, w):
             self.locked_mask = (
                 cv2.resize(self.locked_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
@@ -530,44 +826,51 @@ class InteractiveSession:
             self.anchor_mask = (
                 cv2.resize(self.anchor_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
             )
-        if self._stream_display_locked_only_once:
-            self._stream_display_locked_only_once = False
+
+        cap = self.stream_video_state_cap
+        if cap > 0 and int(self.stream_video_state["num_frames"]) >= cap:
+            self._stream_video_reanchor(rgb)
             return self.locked_mask.copy()
 
-        centroid = _mask_centroid(self.locked_mask)
-        if centroid is None:
-            logging.warning("stream track: no centroid on locked mask; keeping previous mask")
-            return self.locked_mask.copy()
-
-        pts = np.array([[centroid[0], centroid[1]]], dtype=np.float64)
-        lbl = np.array([1], dtype=np.int64)
+        sz = int(self.video_predictor.image_size)
+        offload_v = self.stream_video_offload_video
+        new_fr = rgb_hwc_uint8_to_sam2_image_tensor(rgb, sz, self.device, offload_v).unsqueeze(0)
+        st = self.stream_video_state
+        ref = st["images"]
+        new_fr = new_fr.to(device=ref.device, dtype=ref.dtype)
+        t_prop0 = time.perf_counter()
         try:
             with torch.inference_mode(), self._maybe_autocast:
-                self.image_predictor.set_image(rgb)
-                masks, _scores, _ = self.image_predictor.predict(
-                    point_coords=pts,
-                    point_labels=lbl,
-                    multimask_output=False,
-                    normalize_coords=True,
-                )
-            mask = masks[0] > 0.5
-        except Exception:
-            logging.exception("stream track: predict failed; keeping previous mask")
+                st["images"] = torch.cat([ref, new_fr], dim=0)
+                st["num_frames"] = int(st["images"].shape[0])
+                t_new = st["num_frames"] - 1
+                last_mask: Optional[np.ndarray] = None
+                with _silence_sam2_video_tqdm():
+                    for _f_idx, _obj_ids, video_res_masks in self.video_predictor.propagate_in_video(
+                        st,
+                        start_frame_idx=t_new,
+                        max_frame_num_to_track=1,
+                        reverse=False,
+                    ):
+                        last_mask = video_res_masks[0, 0].detach().cpu().numpy() > 0.5
+        except Exception as e:
+            prop_ms = (time.perf_counter() - t_prop0) * 1000.0
+            self._stream_diag_log_propagate(st, prop_ms, None, h, w, self.locked_mask, repr(e))
+            logging.exception("stream SAM2 video: propagate failed; holding previous mask")
             return self.locked_mask.copy()
+        prop_ms = (time.perf_counter() - t_prop0) * 1000.0
+        prev_locked = self.locked_mask.copy() if self.locked_mask is not None else None
+        self._stream_diag_log_propagate(st, prop_ms, last_mask, h, w, prev_locked, None)
 
-        if not mask.any():
-            logging.debug("stream track: empty mask; keeping previous mask")
-            return self.locked_mask.copy()
-
-        self._stream_stability_ticks += 1
-        if not self.stream_accepts_candidate(mask, h, w):
-            logging.debug("stream track: stability rejected update; keeping previous mask")
+        if last_mask is None or not last_mask.any():
+            logging.debug("stream SAM2 video: empty mask; holding previous mask")
             return self.locked_mask.copy()
 
         self._skip_iou_once = False
-        self.prev_mask = self.locked_mask.copy()
-        self.locked_mask = mask
-        return mask
+        self.prev_mask = prev_locked
+        new_locked = mask_to_shape_hw(last_mask.astype(bool), h, w)
+        self.locked_mask = new_locked
+        return self.locked_mask.copy()
 
     def on_tracking_tick_file(self) -> Optional[np.ndarray]:
         if self.video_masks_by_frame is None:
@@ -586,7 +889,7 @@ class InteractiveSession:
 
 
 def _poll_key() -> int:
-    """Return raw key code (use waitKeyEx when available so arrow keys work)."""
+    """Return raw key code from OpenCV (waitKeyEx when available for extended codes)."""
     if hasattr(cv2, "waitKeyEx"):
         return int(cv2.waitKeyEx(1))
     return int(cv2.waitKey(1))
@@ -636,7 +939,28 @@ def main() -> None:
         "--stream-motion",
         choices=("default", "fast"),
         default="default",
-        help="fast: looser IoU/anchor/centroid gates for rapid motion (slightly higher wrong-object risk).",
+        help="fast: looser IoU/anchor/centroid gates (legacy; only used if centroid stream helpers are re-enabled).",
+    )
+    ap.add_argument(
+        "--stream-video-state-cap",
+        type=int,
+        default=360,
+        help="Webcam/RealSense: max frames in the in-memory SAM2 clip before re-anchoring with add_new_mask "
+        "(0 = unlimited; long runs may OOM as the frame tensor grows).",
+    )
+    ap.add_argument(
+        "--stream-diag-every",
+        type=int,
+        default=0,
+        help="Webcam/RealSense: if >0, log every N stream SAM2 propagate **attempts** (includes empty masks "
+        "and errors; use 5–30). Logs only while TRACKING.",
+    )
+    ap.add_argument(
+        "--lock-on",
+        choices=("click", "enter"),
+        default="click",
+        help="click: after a point click, lock the top multimask and start tracking immediately (default). "
+        "enter: click sets the point only; use , . or arrow keys to cycle masks, then Enter to lock.",
     )
     ap.add_argument(
         "--preview",
@@ -649,6 +973,8 @@ def main() -> None:
     ap.add_argument("--checkpoint", default="sam2_repo/checkpoints/sam2.1_hiera_large.pt")
     ap.add_argument("--model-cfg", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     args = ap.parse_args()
+    if args.preview == "auto":
+        args.preview = "live"
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -687,7 +1013,15 @@ def main() -> None:
         video_predictor=video_predictor,
         frame_source=frame_source,
         source_kind=args.source,
+        stream_video_state_cap=args.stream_video_state_cap,
+        stream_diag_every=args.stream_diag_every,
     )
+    if args.stream_diag_every > 0 and args.source in ("webcam", "realsense"):
+        logging.info(
+            "stream_diag: INFO every %s SAM2 propagate attempts while TRACKING. "
+            "has_mask=0 means an empty prediction that tick.",
+            args.stream_diag_every,
+        )
     if args.stream_motion == "fast":
         session.stream_cfg = StreamStabilityConfig(
             min_iou_vs_prev=0.09,
@@ -706,15 +1040,33 @@ def main() -> None:
             ap.error("--path required for video/images")
         video_disk_path = os.path.abspath(args.path)
 
+    is_file_source = args.source in ("video", "images")
+
+    def mask_disp_after_new_lock(rgb_: np.ndarray, h_: int, w_: int) -> np.ndarray:
+        if args.source in ("webcam", "realsense"):
+            return session.on_tracking_tick_stream(rgb_)
+        if is_file_source and session.video_masks_by_frame is not None:
+            mf = session.on_tracking_tick_file()
+            if mf is not None:
+                if mf.shape != (h_, w_):
+                    mf = cv2.resize(mf.astype(np.uint8), (w_, h_), interpolation=cv2.INTER_NEAREST) > 0
+                return mf.astype(bool)
+        return np.zeros((h_, w_), dtype=bool)
+
     win = "SAM2 interactive"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and session.lock_state in (
-            LockState.NEED_CLICK,
-            LockState.CHOOSE_MASK,
-        ):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if session.lock_state in (LockState.NEED_CLICK, LockState.CHOOSE_MASK):
             session.pending_click_xy = (x, y)
+        elif session.lock_state == LockState.TRACKING and session.source_kind in ("webcam", "realsense"):
+            session.begin_stream_click_repick(x, y)
+            logging.info(
+                "Stream: click repick — new multimask; %s",
+                "locking top mask" if args.lock_on == "click" else "press Enter to lock (, . to cycle)",
+            )
 
     cv2.setMouseCallback(win, on_mouse)
 
@@ -733,7 +1085,7 @@ def main() -> None:
                         0.88 * _loop_fps_smooth + 0.12 * inst_hz if _loop_fps_smooth > 0 else inst_hz
                     )
 
-            is_file = args.source in ("video", "images")
+            is_file = is_file_source
 
             if is_file and session.lock_state != LockState.TRACKING:
                 _sync_file_frame(frame_source, 0)
@@ -753,11 +1105,19 @@ def main() -> None:
             h, w = rgb.shape[:2]
             mask_disp = np.zeros((h, w), dtype=bool)
             hz_note = f" ~{_loop_fps_smooth:.0f} Hz" if args.source in ("webcam", "realsense") else ""
+            lock_help = (
+                "click=lock+track (or stream re-pick) | Space=plan r=reprompt q=quit"
+                if args.lock_on == "click"
+                else "click=point , ./arrows=cycle Enter=lock (stream re-pick same) | Space=plan r=reprompt q=quit"
+            )
             status = [
-                f"{args.source} lock={session.lock_state.name} preview={args.preview}{hz_note}",
-                "click=point , . or arrows=masks Enter=lock Space=plan r=reprompt q=quit",
+                f"{args.source} lock={session.lock_state.name} preview={args.preview} lock-on={args.lock_on}{hz_note}",
+                lock_help,
             ]
             event_only = args.preview == "event_only" and args.source in ("webcam", "realsense")
+            # Avoid a stale frozen overlay if the user is not in event_only mode.
+            if args.source in ("webcam", "realsense") and not event_only:
+                session.event_only_overlay_mask = None
 
             if session.lock_state == LockState.TRACKING:
                 if args.source in ("webcam", "realsense"):
@@ -790,6 +1150,7 @@ def main() -> None:
                                 mask_disp = session.locked_mask.copy()
 
             elif session.lock_state in (LockState.NEED_CLICK, LockState.CHOOSE_MASK):
+                multimask_from_new_click = False
                 if session.pending_click_xy is not None:
                     x, y = session.pending_click_xy
                     pts = np.array([[x, y]], dtype=np.float64)
@@ -799,29 +1160,42 @@ def main() -> None:
                     session.image_reprompt_multimask(rgb, pts, lbl)
                     session.pending_click_xy = None
                     session.lock_state = LockState.CHOOSE_MASK
+                    multimask_from_new_click = True
                 if session.lock_state == LockState.CHOOSE_MASK and session.candidate_masks is not None:
                     cm = session.current_chosen_mask()
                     if cm is not None:
                         mask_disp = cm
+                if (
+                    args.lock_on == "click"
+                    and multimask_from_new_click
+                    and session.lock_state == LockState.CHOOSE_MASK
+                    and session.candidate_masks is not None
+                    and session.lock_prompt_pts is not None
+                ):
+                    if session.finalize_multimask_lock(
+                        rgb,
+                        h,
+                        w,
+                        event_only=event_only,
+                        source=args.source,
+                        video_disk_path=video_disk_path,
+                        frame_source=frame_source,
+                        progress_win=win,
+                    ):
+                        mask_disp = mask_disp_after_new_lock(rgb, h, w)
 
-            mask_draw = mask_disp
             if event_only and session.lock_state == LockState.TRACKING:
                 if session.event_only_overlay_mask is None and session.locked_mask is not None:
-                    lm = session.locked_mask.astype(bool)
-                    if lm.shape != (h, w):
-                        lm = (
-                            cv2.resize(lm.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
-                        )
-                    session.event_only_overlay_mask = lm.astype(bool)
+                    session.event_only_overlay_mask = mask_to_shape_hw(session.locked_mask, h, w)
                 if session.event_only_overlay_mask is not None:
-                    om = session.event_only_overlay_mask
-                    if om.shape != (h, w):
-                        om = (
-                            cv2.resize(om.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
-                        ).astype(bool)
-                        session.event_only_overlay_mask = om
-                    mask_draw = session.event_only_overlay_mask
+                    om = mask_to_shape_hw(session.event_only_overlay_mask, h, w)
+                    session.event_only_overlay_mask = om
+                    mask_draw = om
+                else:
+                    mask_draw = mask_to_shape_hw(mask_disp, h, w)
                 status.append("event_only: Space refreshes overlay")
+            else:
+                mask_draw = mask_to_shape_hw(mask_disp, h, w)
 
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             overlay = overlay_mask_bgr(bgr, mask_draw)
@@ -849,43 +1223,18 @@ def main() -> None:
 
             if key in (13, 10) and session.lock_state == LockState.CHOOSE_MASK:
                 if session.candidate_masks is None or session.lock_prompt_pts is None:
-                    continue
-                session.locked_mask = session.current_chosen_mask()
-                if session.locked_mask is None:
-                    continue
-                session.prev_mask = None
-                session.lock_state = LockState.TRACKING
-                session.candidate_masks = None
-                session.candidate_scores = None
-                session.anchor_mask = session.locked_mask.astype(bool).copy()
-                session._stream_stability_ticks = 0
-                if args.preview == "event_only" and args.source in ("webcam", "realsense"):
-                    lm = session.locked_mask.astype(bool)
-                    if lm.shape != (h, w):
-                        lm = (
-                            cv2.resize(lm.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
-                        )
-                    session.event_only_overlay_mask = lm.astype(bool)
-                else:
-                    session.event_only_overlay_mask = None
-                session._skip_iou_once = True
-                if args.source in ("webcam", "realsense"):
-                    session._stream_display_locked_only_once = True
-
-                if video_disk_path is not None and session.lock_prompt_pts is not None:
-                    logging.info("Video propagate on %s …", video_disk_path)
-                    session.reset_video_file_state(video_disk_path)
-                    bgr_snap = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                    session.run_full_propagation_file(
-                        0,
-                        session.lock_prompt_pts,
-                        session.lock_prompt_labels,
-                        progress_win=win,
-                        progress_bgr=bgr_snap,
-                    )
-                    session.file_frame_index = 0
-                    _sync_file_frame(frame_source, 0)
-                logging.info("Mask locked; tracking.")
+                    pass
+                elif session.finalize_multimask_lock(
+                    rgb,
+                    h,
+                    w,
+                    event_only=event_only,
+                    source=args.source,
+                    video_disk_path=video_disk_path,
+                    frame_source=frame_source,
+                    progress_win=win,
+                ):
+                    mask_disp = mask_disp_after_new_lock(rgb, h, w)
 
             if key == ord(" "):
                 if event_only and session.lock_state == LockState.TRACKING:
