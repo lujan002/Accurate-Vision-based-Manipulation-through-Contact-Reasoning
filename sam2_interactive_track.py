@@ -25,6 +25,10 @@ r      : force full reprompt (clears file + stream state).
 
 ``--preview live`` / ``auto`` : overlay follows ``mask_disp`` every frame. ``event_only`` freezes the
   overlay until **Space** (tracking still runs in the background).
+**Display layout:** OpenCV window is ~1.5× frame width — main view left; right column (half the frame width)
+  stacks two panels: top = mask crop (letterboxed); bottom = placeholder for a future top-down projection
+  (black for now). Default ``--bb-orientation aligned``: axis-aligned ``cv2.boundingRect`` on the largest
+  contour (edges parallel to the frame). Use ``--bb-orientation free`` for the prior ``minAreaRect`` warp.
 ESC / q: quit.
 
 Run from the ``contact_reasoning`` directory (same as ``sam2_test_img.py``). Do not modify ``sam2_test_img.py``.
@@ -243,6 +247,142 @@ def composite_status(bgr: np.ndarray, lines: List[str]) -> np.ndarray:
     return out
 
 
+def _letterbox_bgr(src: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """Resize ``src`` uniformly to fit inside ``out_w``×``out_h`` and center on a black canvas."""
+    out = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    if src.size == 0 or out_w < 1 or out_h < 1:
+        return out
+    sh, sw = src.shape[:2]
+    if sw < 1 or sh < 1:
+        return out
+    scale = min(float(out_w) / float(sw), float(out_h) / float(sh))
+    nw = max(1, int(round(sw * scale)))
+    nh = max(1, int(round(sh * scale)))
+    resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+    y0 = (out_h - nh) // 2
+    x0 = (out_w - nw) // 2
+    out[y0 : y0 + nh, x0 : x0 + nw] = resized
+    return out
+
+
+def _order_quad_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
+    """Order ``cv2.boxPoints`` quad as top-left, top-right, bottom-right, bottom-left (float32)."""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts.astype(np.float32), axis=1).flatten()
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def oriented_min_area_rect_mask_patch_bgr(
+    bgr: np.ndarray,
+    mask_hw: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    """
+    Largest contour of ``mask_hw`` → ``cv2.minAreaRect`` → perspective-warp the tight oriented
+    rectangle to axis-aligned, then letterbox into ``out_w``×``out_h``. Empty mask → black image.
+    """
+    out = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    if out_w < 1 or out_h < 1:
+        return out
+    if bgr.shape[:2] != mask_hw.shape[:2]:
+        return out
+    m = (mask_hw > 0).astype(np.uint8) * 255
+    if not int(m.sum()):
+        return out
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return out
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1.0:
+        return out
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect).astype(np.float32)
+    quad = _order_quad_tl_tr_br_bl(box)
+    wa = float(np.linalg.norm(quad[1] - quad[0]))
+    hb = float(np.linalg.norm(quad[3] - quad[0]))
+    if wa < 1.0 or hb < 1.0:
+        return out
+    iw = max(1, int(np.ceil(wa)))
+    ih = max(1, int(np.ceil(hb)))
+    dst = np.array([[0, 0], [iw - 1, 0], [iw - 1, ih - 1], [0, ih - 1]], dtype=np.float32)
+    try:
+        M = cv2.getPerspectiveTransform(quad, dst)
+    except Exception:
+        return out
+    warped = cv2.warpPerspective(bgr, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return _letterbox_bgr(warped, out_w, out_h)
+
+
+def axis_aligned_bbox_mask_patch_bgr(
+    bgr: np.ndarray,
+    mask_hw: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    """
+    Largest contour of ``mask_hw`` → ``cv2.boundingRect`` (edges parallel to the image), crop ``bgr``,
+    then letterbox into ``out_w``×``out_h``. Empty mask → black image.
+    """
+    out = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    if out_w < 1 or out_h < 1:
+        return out
+    if bgr.shape[:2] != mask_hw.shape[:2]:
+        return out
+    m = (mask_hw > 0).astype(np.uint8) * 255
+    if not int(m.sum()):
+        return out
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return out
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1.0:
+        return out
+    x, y, rw, rh = cv2.boundingRect(cnt)
+    if rw < 1 or rh < 1:
+        return out
+    H, W = bgr.shape[:2]
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(W, int(x) + int(rw))
+    y1 = min(H, int(y) + int(rh))
+    if x1 <= x0 or y1 <= y0:
+        return out
+    crop = bgr[y0:y1, x0:x1]
+    return _letterbox_bgr(crop, out_w, out_h)
+
+
+def composite_main_and_side_panels_bgr(
+    main_bgr: np.ndarray,
+    crop_bgr: np.ndarray,
+    mask_for_crop: np.ndarray,
+    *,
+    bb_orientation: str = "aligned",
+    right_width_frac: float = 0.5,
+) -> np.ndarray:
+    """
+    Place ``main_bgr`` (HxW) on the left and a right column (~``right_width_frac``×W wide, H tall)
+    with a letterboxed crop of ``crop_bgr`` on top (see ``bb_orientation``) and a blank top-down
+    placeholder panel below.
+    """
+    h, w = main_bgr.shape[:2]
+    strip_w = max(1, int(round(float(w) * float(right_width_frac))))
+    ph_top = h // 2
+    ph_bot = h - ph_top
+    if bb_orientation == "free":
+        upper = oriented_min_area_rect_mask_patch_bgr(crop_bgr, mask_for_crop, strip_w, ph_top)
+    else:
+        upper = axis_aligned_bbox_mask_patch_bgr(crop_bgr, mask_for_crop, strip_w, ph_top)
+    lower = np.zeros((ph_bot, strip_w, 3), dtype=np.uint8)
+    right = np.vstack([upper, lower])
+    return np.hstack([main_bgr, right])
+
+
 class FrameSource(ABC):
     @abstractmethod
     def read(self) -> Optional[np.ndarray]:
@@ -446,6 +586,8 @@ class InteractiveSession:
 
     # After lock, skip one IoU check so we do not compare centroid refinement to the multimask.
     _skip_iou_once: bool = False
+    # GUI: width of the main video column in the composite window (clicks to the right are ignored).
+    gui_main_panel_width: int = 0
 
     def __post_init__(self) -> None:
         self._maybe_autocast = nullcontext()
@@ -970,6 +1112,13 @@ def main() -> None:
         "only on Space (tracking still runs each frame). Video/images always use a live overlay. "
         "auto: same as live.",
     )
+    ap.add_argument(
+        "--bb-orientation",
+        choices=("aligned", "free"),
+        default="aligned",
+        help="Top-right mask crop: aligned (default) = axis-aligned boundingRect, same orientation as the "
+        "video; free = minAreaRect tight oriented rectangle warped upright (legacy).",
+    )
     ap.add_argument("--checkpoint", default="sam2_repo/checkpoints/sam2.1_hiera_large.pt")
     ap.add_argument("--model-cfg", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     args = ap.parse_args()
@@ -1058,6 +1207,8 @@ def main() -> None:
 
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if session.gui_main_panel_width > 0 and x >= session.gui_main_panel_width:
             return
         if session.lock_state in (LockState.NEED_CLICK, LockState.CHOOSE_MASK):
             session.pending_click_xy = (x, y)
@@ -1199,7 +1350,11 @@ def main() -> None:
 
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             overlay = overlay_mask_bgr(bgr, mask_draw)
-            vis = composite_status(overlay, status)
+            main_panel = composite_status(overlay, status)
+            session.gui_main_panel_width = w
+            vis = composite_main_and_side_panels_bgr(
+                main_panel, bgr, mask_draw, bb_orientation=args.bb_orientation
+            )
             session.last_bgr_display = vis
 
             cv2.imshow(win, vis)
