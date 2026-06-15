@@ -26,9 +26,20 @@ r      : force full reprompt (clears file + stream state).
 ``--preview live`` / ``auto`` : overlay follows ``mask_disp`` every frame. ``event_only`` freezes the
   overlay until **Space** (tracking still runs in the background).
 **Display layout:** OpenCV window is ~1.5× frame width — main view left; right column (half the frame width)
-  stacks two panels: top = mask crop (letterboxed); bottom = placeholder for a future top-down projection
-  (black for now). Default ``--bb-orientation aligned``: axis-aligned ``cv2.boundingRect`` on the largest
-  contour (edges parallel to the frame). Use ``--bb-orientation free`` for the prior ``minAreaRect`` warp.
+  stacks two panels. When ``--top-down on`` and the green quad is set, the **lower** half shows the
+  **reprojected masked object**: the four clicks are only a *template* mapping the quad to a rectangle
+  whose aspect is **metrically recovered** from the corners (the camera focal length is estimated from the
+  four points; principal point assumed at image center), falling back to the quad edge ratio for near-frontal
+  views. That single homography is applied to the whole frame, so the segmentation mask is reprojected
+  correctly wherever it sits — it need not overlap the green quad. The plan-space bounding box of the mask
+  is then auto-framed (letterboxed) into the panel,
+  so no expand factor is needed. The **upper** half shows an **oriented min-area rectangle** warp of the
+  mask (image-plane upright crop, not the table model). When ``--top-down off`` (or before the quad exists),
+  the top panel follows ``--bb-orientation``: ``aligned`` = ``cv2.boundingRect`` crop; ``free`` =
+  ``minAreaRect`` warp. Four clicks define the table quad (TL, TR, BR, BL in the image). ``t`` clears
+  calibration. ``--top-down off``: lower panel black.
+  **Note:** Anything not on the table plane (keyboard height, hands, walls) will still look perspective in
+  the plan panel; only the table patch is modeled.
 ESC / q: quit.
 
 Run from the ``contact_reasoning`` directory (same as ``sam2_test_img.py``). Do not modify ``sam2_test_img.py``.
@@ -41,8 +52,9 @@ slow or power-managed USB drive: move the project/venv to an internal SSD, or se
 
 **Webcam performance:** temporal memory costs more per frame than the old centroid+image path. Use
 ``--webcam-buffer 1`` (default), optional ``--webcam-fps`` / ``--webcam-width`` / ``--webcam-height``,
-``--webcam-flush-grabs`` to reduce backlog, and tune ``--stream-video-state-cap`` (lower cap = more frequent
-re-anchor, less GPU RAM for the frame tensor stack). Effective FPS is usually capped by SAM inference time.
+``--webcam-device /dev/videoN`` (overrides ``--webcam-id``), ``--webcam-flush-grabs`` to reduce backlog,
+and tune ``--stream-video-state-cap`` (lower cap = more frequent re-anchor, less GPU RAM for the frame tensor
+stack). Effective FPS is usually capped by SAM inference time.
 """
 
 from __future__ import annotations
@@ -364,23 +376,306 @@ def composite_main_and_side_panels_bgr(
     *,
     bb_orientation: str = "aligned",
     right_width_frac: float = 0.5,
+    lower_panel_bgr: Optional[np.ndarray] = None,
+    upper_panel_bgr: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Place ``main_bgr`` (HxW) on the left and a right column (~``right_width_frac``×W wide, H tall)
-    with a letterboxed crop of ``crop_bgr`` on top (see ``bb_orientation``) and a blank top-down
-    placeholder panel below.
+    with an upper panel and a lower panel (black, or ``lower_panel_bgr`` if it matches the expected size).
+
+    If ``upper_panel_bgr`` matches ``(ph_top, strip_w)``, it is used as-is. Otherwise the upper panel is a
+    letterboxed crop of ``crop_bgr`` (see ``bb_orientation``).
     """
     h, w = main_bgr.shape[:2]
     strip_w = max(1, int(round(float(w) * float(right_width_frac))))
     ph_top = h // 2
     ph_bot = h - ph_top
-    if bb_orientation == "free":
+    if (
+        upper_panel_bgr is not None
+        and upper_panel_bgr.ndim == 3
+        and upper_panel_bgr.shape[0] == ph_top
+        and upper_panel_bgr.shape[1] == strip_w
+    ):
+        upper = upper_panel_bgr
+    elif bb_orientation == "free":
         upper = oriented_min_area_rect_mask_patch_bgr(crop_bgr, mask_for_crop, strip_w, ph_top)
     else:
         upper = axis_aligned_bbox_mask_patch_bgr(crop_bgr, mask_for_crop, strip_w, ph_top)
-    lower = np.zeros((ph_bot, strip_w, 3), dtype=np.uint8)
+    if (
+        lower_panel_bgr is not None
+        and lower_panel_bgr.ndim == 3
+        and lower_panel_bgr.shape[0] == ph_bot
+        and lower_panel_bgr.shape[1] == strip_w
+    ):
+        lower = lower_panel_bgr
+    else:
+        lower = np.zeros((ph_bot, strip_w, 3), dtype=np.uint8)
     right = np.vstack([upper, lower])
     return np.hstack([main_bgr, right])
+
+
+def _quad_double_area(pts: np.ndarray) -> float:
+    """Twice the signed polygon area of ordered points (4,2); used to reject degenerate quads."""
+    p = pts.astype(np.float64)
+    if p.shape != (4, 2):
+        return 0.0
+    s = 0.0
+    for i in range(4):
+        j = (i + 1) % 4
+        s += p[i, 0] * p[j, 1] - p[j, 0] * p[i, 1]
+    return float(s)
+
+
+def _plan_rect_aspect_from_quad(src_quad_tl_tr_br_bl: np.ndarray) -> float:
+    """
+    Width/height aspect of the rectified rectangle implied by the calibration quad, using the **average of
+    opposite edges** (more stable than a single edge): ``width = mean(|TR-TL|, |BR-BL|)`` and
+    ``height = mean(|BL-TL|, |BR-TR|)``. Clamped to a sane range.
+
+    This is only a template aspect; a 4-point homography removes perspective exactly regardless, so a
+    slightly off aspect merely stretches the plan view uniformly (it never re-introduces a trapezoid look).
+    """
+    q = np.asarray(src_quad_tl_tr_br_bl, dtype=np.float64).reshape(4, 2)
+    top = float(np.linalg.norm(q[1] - q[0]))
+    bottom = float(np.linalg.norm(q[2] - q[3]))
+    left = float(np.linalg.norm(q[3] - q[0]))
+    right = float(np.linalg.norm(q[2] - q[1]))
+    width = max(0.5 * (top + bottom), 1e-3)
+    height = max(0.5 * (left + right), 1e-3)
+    return float(np.clip(width / height, 0.05, 20.0))
+
+
+def _recover_rect_aspect_metric(
+    src_quad_tl_tr_br_bl: np.ndarray,
+    image_w: int,
+    image_h: int,
+) -> Optional[float]:
+    """
+    True width/height aspect of the real-world rectangle from its perspective image (Zhang & He,
+    "Whiteboard scanning and image enhancement"), or ``None`` when the geometry is degenerate.
+
+    Estimates the camera focal length from the two vanishing points (principal point assumed at the image
+    center), then recovers the rectangle aspect via the image of the absolute conic. Returns ``None`` for
+    near-affine views (vanishing points at infinity) or invalid focal estimates, so the caller can fall
+    back to ``_plan_rect_aspect_from_quad`` — which is accurate precisely in that near-affine regime.
+    """
+    eps = 1e-9
+    q = np.asarray(src_quad_tl_tr_br_bl, dtype=np.float64).reshape(4, 2)
+    u0 = 0.5 * float(image_w)
+    v0 = 0.5 * float(image_h)
+    # Principal point to origin; homogeneous. Ordering: m1=TL, m2=TR, m3=BL, m4=BR.
+    m1 = np.array([q[0, 0] - u0, q[0, 1] - v0, 1.0])
+    m2 = np.array([q[1, 0] - u0, q[1, 1] - v0, 1.0])
+    m3 = np.array([q[3, 0] - u0, q[3, 1] - v0, 1.0])
+    m4 = np.array([q[2, 0] - u0, q[2, 1] - v0, 1.0])
+
+    c14 = np.cross(m1, m4)
+    den_k2 = float(np.dot(np.cross(m2, m4), m3))
+    den_k3 = float(np.dot(np.cross(m3, m4), m2))
+    if abs(den_k2) < eps or abs(den_k3) < eps:
+        return None
+    k2 = float(np.dot(c14, m3)) / den_k2
+    k3 = float(np.dot(c14, m2)) / den_k3
+
+    n2 = k2 * m2 - m1
+    n3 = k3 * m3 - m1
+
+    denom = n2[2] * n3[2]
+    if abs(denom) < eps:
+        return None
+    f2 = -(n2[0] * n3[0] + n2[1] * n3[1]) / denom
+    if not np.isfinite(f2) or f2 <= 0.0:
+        return None
+
+    num = (n2[0] ** 2 + n2[1] ** 2) / f2 + n2[2] ** 2
+    dna = (n3[0] ** 2 + n3[1] ** 2) / f2 + n3[2] ** 2
+    if not np.isfinite(num) or not np.isfinite(dna) or dna <= eps or num <= eps:
+        return None
+    ratio2 = num / dna
+    if not np.isfinite(ratio2) or ratio2 <= 0.0:
+        return None
+    aspect = float(np.sqrt(ratio2))
+    if not np.isfinite(aspect) or not (0.05 <= aspect <= 20.0):
+        return None
+    return aspect
+
+
+def compute_table_topdown_homography(
+    src_quad_tl_tr_br_bl: np.ndarray,
+    *,
+    image_w: int,
+    image_h: int,
+) -> Optional[np.ndarray]:
+    """
+    Homography H (3×3) mapping image pixels onto a metric **plan frame**, or None.
+
+    The calibration quad is the *template* only: it is mapped to an axis-aligned rectangle whose aspect
+    ratio is **metrically recovered** from the four corners (``_recover_rect_aspect_metric``, which
+    estimates the camera focal length), falling back to the edge-length ratio
+    (``_plan_rect_aspect_from_quad``) when the view is near-affine or the estimate is invalid. The
+    rectangle is placed at the plan origin with a fixed base height; the absolute scale is irrelevant
+    because the caller re-frames the plan onto the panel. Because H is a plane-to-plane homography it
+    applies to **every** pixel, not just those inside the green quad, so the segmentation mask is
+    reprojected correctly wherever it lies.
+    """
+    src = np.asarray(src_quad_tl_tr_br_bl, dtype=np.float32).reshape(4, 2)
+    if abs(_quad_double_area(src)) < 8.0:
+        return None
+    aspect = _recover_rect_aspect_metric(src, image_w, image_h)
+    if aspect is None:
+        aspect = _plan_rect_aspect_from_quad(src)
+    base_h = 1000.0
+    base_w = max(1.0, aspect * base_h)
+    dst = np.array(
+        [[0.0, 0.0], [base_w, 0.0], [base_w, base_h], [0.0, base_h]],
+        dtype=np.float32,
+    )
+    try:
+        return cv2.getPerspectiveTransform(src, dst)
+    except Exception:
+        return None
+
+
+def _plan_bbox_of_mask(H: np.ndarray, mask_hw: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
+    """Plan-space (x0, y0, x1, y1) bounding box of the mask's nonzero pixels after applying ``H``."""
+    ys, xs = np.where(mask_hw > 0)
+    if xs.size == 0:
+        return None
+    pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1).reshape(-1, 1, 2)
+    plan = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+    finite = plan[np.isfinite(plan).all(axis=1)]
+    if finite.shape[0] == 0:
+        return None
+    x0, y0 = float(finite[:, 0].min()), float(finite[:, 1].min())
+    x1, y1 = float(finite[:, 0].max()), float(finite[:, 1].max())
+    if not (np.isfinite([x0, y0, x1, y1]).all()) or (x1 - x0) < 1e-3 or (y1 - y0) < 1e-3:
+        return None
+    return x0, y0, x1, y1
+
+
+def warp_segmentation_mask_topdown_bgr(
+    bgr: np.ndarray,
+    mask_hw: np.ndarray,
+    src_quad_tl_tr_br_bl: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> Optional[np.ndarray]:
+    """
+    Reproject the masked object to a top-down view and **auto-frame** it in the panel.
+
+    The green quad defines a single homography ``H`` (image → plan; see ``compute_table_topdown_homography``)
+    that is applied to the whole frame. The plan-space bounding box of the mask is then letterboxed (aspect
+    preserved) into ``out_w``×``out_h`` via an affine ``S``, and the frame is sampled with ``M = S @ H`` so
+    the object fills the panel wherever it sits relative to the calibration quad. RGB is kept only where the
+    warped mask is positive. ``mask_hw`` must match ``bgr`` size.
+    """
+    if out_w < 2 or out_h < 2:
+        return None
+    if bgr.shape[:2] != mask_hw.shape[:2]:
+        return None
+    if not (mask_hw > 0).any():
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    H = compute_table_topdown_homography(
+        src_quad_tl_tr_br_bl, image_w=bgr.shape[1], image_h=bgr.shape[0]
+    )
+    if H is None or not np.isfinite(H).all():
+        return None
+
+    bbox = _plan_bbox_of_mask(H, mask_hw)
+    if bbox is None:
+        return None
+    x0, y0, x1, y1 = bbox
+    bw = x1 - x0
+    bh = y1 - y0
+    margin = 0.08
+    x0 -= margin * bw
+    x1 += margin * bw
+    y0 -= margin * bh
+    y1 += margin * bh
+    bw = max(x1 - x0, 1e-3)
+    bh = max(y1 - y0, 1e-3)
+
+    ow = float(max(1, out_w - 1))
+    oh = float(max(1, out_h - 1))
+    scale = min(ow / bw, oh / bh)
+    tx = 0.5 * (ow - scale * bw) - scale * x0
+    ty = 0.5 * (oh - scale * bh) - scale * y0
+    S = np.array([[scale, 0.0, tx], [0.0, scale, ty], [0.0, 0.0, 1.0]], dtype=np.float64)
+    M = (S @ H.astype(np.float64)).astype(np.float32)
+    if not np.isfinite(M).all():
+        return None
+
+    plan_bgr = cv2.warpPerspective(
+        bgr,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    m_u8 = (mask_hw > 0).astype(np.uint8) * 255
+    plan_m_u8 = cv2.warpPerspective(
+        m_u8,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    plan_m = plan_m_u8.astype(np.float32) / 255.0
+    alpha = np.clip(plan_m[..., None], 0.0, 1.0)
+    out = plan_bgr.astype(np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def topdown_panel_message_bgr(out_w: int, out_h: int, lines: List[str]) -> np.ndarray:
+    """Dark panel with short status lines (fits narrow lower-right strip)."""
+    panel = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    panel[:] = (28, 28, 28)
+    y = 16
+    for line in lines[:4]:
+        if not line:
+            continue
+        short = line if len(line) <= 48 else line[:45] + "..."
+        cv2.putText(
+            panel,
+            short,
+            (4, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 18
+    return panel
+
+
+def draw_table_topdown_calibration_overlay(
+    main_bgr: np.ndarray,
+    clicks: List[Tuple[int, int]],
+    src_quad: Optional[np.ndarray],
+) -> None:
+    """Draw homography helpers on the main BGR panel (in place)."""
+    if src_quad is not None:
+        q = np.asarray(src_quad, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(main_bgr, [q], True, (0, 200, 0), 2)
+    if len(clicks) >= 2:
+        pts = np.array(clicks, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(main_bgr, [pts], False, (0, 255, 255), 1)
+    for i, (px, py) in enumerate(clicks):
+        cv2.circle(main_bgr, (int(px), int(py)), 6, (0, 255, 255), 2)
+        cv2.putText(
+            main_bgr,
+            str(i + 1),
+            (int(px) + 8, int(py) - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
 
 class FrameSource(ABC):
@@ -398,7 +693,7 @@ class WebcamSource(FrameSource):
 
     def __init__(
         self,
-        device_id: int = 0,
+        device: int | str = 0,
         width: int = 0,
         height: int = 0,
         fps: float = 0.0,
@@ -406,9 +701,9 @@ class WebcamSource(FrameSource):
         flush_grabs: int = 0,
     ):
         self.flush_grabs = max(0, int(flush_grabs))
-        self.cap = cv2.VideoCapture(device_id)
+        self.cap = cv2.VideoCapture(device)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open webcam {device_id}")
+            raise RuntimeError(f"Could not open webcam {device!r}")
         if width > 0:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
         if height > 0:
@@ -508,6 +803,7 @@ def build_frame_source(
     path: Optional[str],
     webcam_id: int,
     *,
+    webcam_device: Optional[str] = None,
     webcam_width: int = 0,
     webcam_height: int = 0,
     webcam_fps: float = 0.0,
@@ -515,8 +811,11 @@ def build_frame_source(
     webcam_flush_grabs: int = 0,
 ) -> FrameSource:
     if source == "webcam":
+        dev: int | str = webcam_id
+        if webcam_device is not None and webcam_device.strip():
+            dev = webcam_device.strip()
         return WebcamSource(
-            webcam_id,
+            dev,
             width=webcam_width,
             height=webcam_height,
             fps=webcam_fps,
@@ -588,11 +887,19 @@ class InteractiveSession:
     _skip_iou_once: bool = False
     # GUI: width of the main video column in the composite window (clicks to the right are ignored).
     gui_main_panel_width: int = 0
+    # Optional table plane: four image clicks (TL,TR,BR,BL of plan rectangle) for lower-panel homography.
+    table_cal_clicks: List[Tuple[int, int]] = field(default_factory=list)
+    table_topdown_src_quad: Optional[np.ndarray] = None  # (4,2) float32 when calibration succeeded
 
     def __post_init__(self) -> None:
         self._maybe_autocast = nullcontext()
         if self.device.type == "cuda":
             self._maybe_autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+
+    def reset_table_topdown_cal(self) -> None:
+        """Clear interactive table-plane clicks and homography (``t`` key when ``--top-down on``)."""
+        self.table_cal_clicks = []
+        self.table_topdown_src_quad = None
 
     def begin_stream_click_repick(self, x: int, y: int) -> None:
         """Webcam/RealSense: new click during TRACKING — discard stream memory and pick a fresh point."""
@@ -1061,7 +1368,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Interactive SAM2 tracking (see module docstring).")
     ap.add_argument("--source", choices=["webcam", "video", "images", "realsense"], default="webcam")
     ap.add_argument("--path", type=str, default=None, help="Video file or image directory")
-    ap.add_argument("--webcam-id", type=int, default=0)
+    ap.add_argument("--webcam-id", type=int, default=0, help="OpenCV capture index (default 0). Ignored if --webcam-device is set.")
+    ap.add_argument(
+        "--webcam-device",
+        type=str,
+        default=None,
+        help="V4L2 device path, e.g. /dev/video2. Overrides --webcam-id. Only with --source webcam.",
+    )
     ap.add_argument("--webcam-fps", type=float, default=0.0, help="Optional CAP_PROP_FPS (0 = driver default).")
     ap.add_argument("--webcam-width", type=int, default=0, help="Optional capture width (0 = driver default).")
     ap.add_argument("--webcam-height", type=int, default=0, help="Optional capture height (0 = driver default).")
@@ -1116,14 +1429,28 @@ def main() -> None:
         "--bb-orientation",
         choices=("aligned", "free"),
         default="aligned",
-        help="Top-right mask crop: aligned (default) = axis-aligned boundingRect, same orientation as the "
-        "video; free = minAreaRect tight oriented rectangle warped upright (legacy).",
+        help="Top-right panel when --top-down off (or before quad is set): aligned (default) = axis-aligned "
+        "boundingRect; free = minAreaRect warp upright. When --top-down on and the quad is set, the upper "
+        "panel is always the minAreaRect mask warp (table plan is only the lower panel).",
+    )
+    ap.add_argument(
+        "--top-down",
+        choices=("off", "on"),
+        default="off",
+        help="off: right column lower half stays black. on: four clicks define the table quad (the homography "
+        "template); the lower half shows the masked object reprojected top-down and auto-framed. t=reset.",
     )
     ap.add_argument("--checkpoint", default="sam2_repo/checkpoints/sam2.1_hiera_large.pt")
     ap.add_argument("--model-cfg", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     args = ap.parse_args()
     if args.preview == "auto":
         args.preview = "live"
+    if args.webcam_device is not None and args.source != "webcam":
+        ap.error("--webcam-device is only valid with --source webcam")
+    if args.webcam_device and args.webcam_device.strip():
+        wd = args.webcam_device.strip()
+        if wd.startswith("/dev/") and not os.path.exists(wd):
+            logging.warning("webcam path does not exist (yet): %s", wd)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -1149,6 +1476,7 @@ def main() -> None:
         args.source,
         args.path,
         args.webcam_id,
+        webcam_device=args.webcam_device,
         webcam_width=args.webcam_width,
         webcam_height=args.webcam_height,
         webcam_fps=args.webcam_fps,
@@ -1183,6 +1511,11 @@ def main() -> None:
         )
         logging.info("stream-motion=fast: relaxed stream stability gates")
 
+    if args.top_down == "on":
+        logging.info(
+            "Top-down mode: four table clicks (TL,TR,BR,BL) define the homography template. t resets."
+        )
+
     video_disk_path: Optional[str] = None
     if args.source in ("video", "images"):
         if not args.path:
@@ -1209,6 +1542,34 @@ def main() -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         if session.gui_main_panel_width > 0 and x >= session.gui_main_panel_width:
+            return
+        if (
+            args.top_down == "on"
+            and session.table_topdown_src_quad is None
+            and len(session.table_cal_clicks) < 4
+        ):
+            session.table_cal_clicks.append((int(x), int(y)))
+            n = len(session.table_cal_clicks)
+            logging.info("Table top-down: point %s/4 at (%s, %s)", n, x, y)
+            if n == 4:
+                quad = np.array(session.table_cal_clicks, dtype=np.float32)
+                if abs(_quad_double_area(quad)) < 8.0:
+                    logging.warning("Table quad nearly degenerate; removing last point.")
+                    session.table_cal_clicks.pop()
+                else:
+                    probe_dst = np.array([[0, 0], [99, 0], [99, 99], [0, 99]], dtype=np.float32)
+                    try:
+                        _ = cv2.getPerspectiveTransform(quad, probe_dst)
+                    except Exception:
+                        logging.warning(
+                            "Table homography failed (wrong click order?). Removing last point — "
+                            "use plan TL, TR, BR, BL on the image."
+                        )
+                        session.table_cal_clicks.pop()
+                    else:
+                        session.table_topdown_src_quad = quad
+                        session.table_cal_clicks.clear()
+                        logging.info("Table top-down homography ready.")
             return
         if session.lock_state in (LockState.NEED_CLICK, LockState.CHOOSE_MASK):
             session.pending_click_xy = (x, y)
@@ -1265,6 +1626,17 @@ def main() -> None:
                 f"{args.source} lock={session.lock_state.name} preview={args.preview} lock-on={args.lock_on}{hz_note}",
                 lock_help,
             ]
+            if args.top_down == "on":
+                if session.table_topdown_src_quad is None:
+                    status.append(
+                        "top-down: click 4 coplanar corners — (1) plan upper-left (2) upper-right "
+                        "(3) lower-right (4) lower-left of one table rectangle | t=reset"
+                    )
+                else:
+                    status.append(
+                        "top-down: homography active — upper=oriented mask rect | lower=reprojected mask "
+                        "(auto-framed) | t=reset"
+                    )
             event_only = args.preview == "event_only" and args.source in ("webcam", "realsense")
             # Avoid a stale frozen overlay if the user is not in event_only mode.
             if args.source in ("webcam", "realsense") and not event_only:
@@ -1351,9 +1723,47 @@ def main() -> None:
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             overlay = overlay_mask_bgr(bgr, mask_draw)
             main_panel = composite_status(overlay, status)
+            if args.top_down == "on":
+                draw_table_topdown_calibration_overlay(
+                    main_panel, session.table_cal_clicks, session.table_topdown_src_quad
+                )
             session.gui_main_panel_width = w
+            strip_w = max(1, int(round(float(w) * 0.5)))
+            ph_top = h // 2
+            ph_bot = h - ph_top
+            lower_panel_bgr: Optional[np.ndarray] = None
+            upper_panel_bgr: Optional[np.ndarray] = None
+            if args.top_down == "on" and session.table_topdown_src_quad is not None:
+                q = session.table_topdown_src_quad
+                if not (mask_draw > 0).any():
+                    lower_panel_bgr = topdown_panel_message_bgr(
+                        strip_w, ph_bot, ["No segmentation yet.", "Lock/track an object on the table."]
+                    )
+                else:
+                    # Upper: tight oriented-rect unwarp of the mask (image-plane); distinct from table plan.
+                    upper_panel_bgr = oriented_min_area_rect_mask_patch_bgr(
+                        bgr, mask_draw, strip_w, ph_top
+                    )
+                    lower_panel_bgr = warp_segmentation_mask_topdown_bgr(
+                        bgr,
+                        mask_draw,
+                        q,
+                        strip_w,
+                        ph_bot,
+                    )
+                    if lower_panel_bgr is None or int(lower_panel_bgr.sum()) == 0:
+                        lower_panel_bgr = topdown_panel_message_bgr(
+                            strip_w,
+                            ph_bot,
+                            ["Warp produced empty panel.", "Try re-ordering TL,TR,BR,BL (t)."],
+                        )
             vis = composite_main_and_side_panels_bgr(
-                main_panel, bgr, mask_draw, bb_orientation=args.bb_orientation
+                main_panel,
+                bgr,
+                mask_draw,
+                bb_orientation=args.bb_orientation,
+                lower_panel_bgr=lower_panel_bgr,
+                upper_panel_bgr=upper_panel_bgr,
             )
             session.last_bgr_display = vis
 
@@ -1364,6 +1774,9 @@ def main() -> None:
 
             if key in (27, ord("q")):
                 break
+            if key == ord("t") and args.top_down == "on":
+                session.reset_table_topdown_cal()
+                logging.info("Table top-down calibration cleared.")
             if key == ord("r"):
                 session.begin_reprompt()
                 logging.info("User reprompt")
