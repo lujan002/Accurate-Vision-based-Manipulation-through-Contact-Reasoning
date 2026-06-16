@@ -38,6 +38,15 @@ r      : force full reprompt (clears file + stream state).
   the top panel follows ``--bb-orientation``: ``aligned`` = ``cv2.boundingRect`` crop; ``free`` =
   ``minAreaRect`` warp. Four clicks define the table quad (TL, TR, BR, BL in the image). ``t`` clears
   calibration. ``--top-down off``: lower panel black.
+  **Top-down outline:** the lower panel fuses the current mask with optional pruned recent masks
+  (``--topdown-outline-history``, ``--topdown-outline-history-iou-min``, ``--topdown-outline-history-max-centroid-px``;
+  history default 0 = off). Optionally OR the lock-time anchor with ``--topdown-outline-fuse-anchor``. Fusion clips
+  to ``dilate(current)`` unless ``--no-topdown-outline-fuse-clip``; then only CCs touching raw current remain unless
+  ``--no-topdown-outline-fuse-cc-filter``. Empty-current path uses ``past[-1]`` plus anchor clipped to
+  ``dilate(past[-1])``. Boundary / contour smoothing (``--topdown-outline-blur-sigma``,
+  ``--topdown-outline-contour-smooth-sigma``) default to 8; use 0 to disable either. Contour smoothing is
+  **corner-aware** by default (straight edges → chords; corners stay tighter). Pass
+  ``--no-topdown-outline-preserve-corners`` for legacy circular smoothing.
   **Note:** Anything not on the table plane (keyboard height, hands, walls) will still look perspective in
   the plan panel; only the table patch is modeled.
 ESC / q: quit.
@@ -52,7 +61,10 @@ slow or power-managed USB drive: move the project/venv to an internal SSD, or se
 
 **Webcam performance:** temporal memory costs more per frame than the old centroid+image path. Use
 ``--webcam-buffer 1`` (default), optional ``--webcam-fps`` / ``--webcam-width`` / ``--webcam-height``,
-``--webcam-device /dev/videoN`` (overrides ``--webcam-id``), ``--webcam-flush-grabs`` to reduce backlog,
+``--webcam-device /dev/videoN`` (overrides ``--webcam-id``). On Linux one physical camera often exposes several
+nodes (color vs metadata/IR); if ``/dev/video4`` exists but capture fails with ``VIDIOC_REQBUFS``, use
+``--webcam-probe`` or leave ``--webcam-fallback-siblings on`` (default) to try neighboring indices.
+``--webcam-flush-grabs`` to reduce backlog,
 and tune ``--stream-video-state-cap`` (lower cap = more frequent re-anchor, less GPU RAM for the frame tensor
 stack). Effective FPS is usually capped by SAM inference time.
 """
@@ -73,9 +85,11 @@ if _pyc:
 import argparse
 import glob
 import logging
+import re
+import sys
 import time
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -99,6 +113,13 @@ except KeyboardInterrupt:
         "internal SSD, or run:  export PYTHONPYCACHEPREFIX=/tmp/sam2_pyc  "
         "then retry (keeps .pyc off the external disk)."
     ) from None
+
+from topdown_outline import (
+    draw_outline_overlay_bgr,
+    fuse_outline_masks_image_plane,
+    outline_from_topdown_mask,
+    prune_outline_history_masks,
+)
 
 OBJ_ID = 1
 
@@ -553,31 +574,32 @@ def _plan_bbox_of_mask(H: np.ndarray, mask_hw: np.ndarray) -> Optional[Tuple[flo
     return x0, y0, x1, y1
 
 
-def warp_segmentation_mask_topdown_bgr(
-    bgr: np.ndarray,
+@dataclass(frozen=True)
+class TopdownPanelData:
+    """Image → panel warp: composite matrix ``M`` and warped binary mask (values 0 or 255)."""
+
+    M: np.ndarray  # (3, 3) float32
+    plan_mask_u8: np.ndarray  # (out_h, out_w) uint8
+    out_w: int
+    out_h: int
+
+
+def _warp_topdown_panel_from_mask(
     mask_hw: np.ndarray,
     src_quad_tl_tr_br_bl: np.ndarray,
     out_w: int,
     out_h: int,
-) -> Optional[np.ndarray]:
+) -> Optional[TopdownPanelData]:
     """
-    Reproject the masked object to a top-down view and **auto-frame** it in the panel.
+    Shared homography + letterbox warp for the table top-down panel (mask only).
 
-    The green quad defines a single homography ``H`` (image → plan; see ``compute_table_topdown_homography``)
-    that is applied to the whole frame. The plan-space bounding box of the mask is then letterboxed (aspect
-    preserved) into ``out_w``×``out_h`` via an affine ``S``, and the frame is sampled with ``M = S @ H`` so
-    the object fills the panel wherever it sits relative to the calibration quad. RGB is kept only where the
-    warped mask is positive. ``mask_hw`` must match ``bgr`` size.
+    Returns ``None`` if calibration or mask plan bbox is invalid. Caller handles empty masks.
     """
     if out_w < 2 or out_h < 2:
         return None
-    if bgr.shape[:2] != mask_hw.shape[:2]:
-        return None
-    if not (mask_hw > 0).any():
-        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
-
+    image_h, image_w = int(mask_hw.shape[0]), int(mask_hw.shape[1])
     H = compute_table_topdown_homography(
-        src_quad_tl_tr_br_bl, image_w=bgr.shape[1], image_h=bgr.shape[0]
+        src_quad_tl_tr_br_bl, image_w=image_w, image_h=image_h
     )
     if H is None or not np.isfinite(H).all():
         return None
@@ -606,14 +628,6 @@ def warp_segmentation_mask_topdown_bgr(
     if not np.isfinite(M).all():
         return None
 
-    plan_bgr = cv2.warpPerspective(
-        bgr,
-        M,
-        (out_w, out_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
-    )
     m_u8 = (mask_hw > 0).astype(np.uint8) * 255
     plan_m_u8 = cv2.warpPerspective(
         m_u8,
@@ -623,10 +637,88 @@ def warp_segmentation_mask_topdown_bgr(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
+    return TopdownPanelData(M=M, plan_mask_u8=plan_m_u8, out_w=out_w, out_h=out_h)
+
+
+def warp_mask_topdown_u8(
+    mask_hw: np.ndarray,
+    src_quad_tl_tr_br_bl: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> Optional[np.ndarray]:
+    """
+    Warp a binary segmentation mask into the auto-framed top-down panel (``out_w``×``out_h``).
+
+    Returns ``uint8`` with values 0 or 255, or ``None`` if warp fails. Empty ``mask_hw`` yields a
+    zero panel (no homography needed). For CNN-style inputs later, stack this mask with normalized
+    ``(x-cx)/s``, ``(y-cy)/s`` grids in the same panel frame.
+    """
+    if out_w < 2 or out_h < 2:
+        return None
+    if not (mask_hw > 0).any():
+        return np.zeros((out_h, out_w), dtype=np.uint8)
+    data = _warp_topdown_panel_from_mask(mask_hw, src_quad_tl_tr_br_bl, out_w, out_h)
+    return None if data is None else data.plan_mask_u8
+
+
+def warp_segmentation_mask_topdown_bgr_and_mask(
+    bgr: np.ndarray,
+    mask_hw: np.ndarray,
+    src_quad_tl_tr_br_bl: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Same warp as ``warp_segmentation_mask_topdown_bgr``, but returns both the composited BGR panel and
+    the warped binary mask (0 / 255) for outline / metrics without recomputing ``M``.
+    """
+    if out_w < 2 or out_h < 2:
+        return None
+    if bgr.shape[:2] != mask_hw.shape[:2]:
+        return None
+    if not (mask_hw > 0).any():
+        z = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        zm = np.zeros((out_h, out_w), dtype=np.uint8)
+        return z, zm
+    data = _warp_topdown_panel_from_mask(mask_hw, src_quad_tl_tr_br_bl, out_w, out_h)
+    if data is None:
+        return None
+    M = data.M
+    plan_m_u8 = data.plan_mask_u8
+    plan_bgr = cv2.warpPerspective(
+        bgr,
+        M,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
     plan_m = plan_m_u8.astype(np.float32) / 255.0
     alpha = np.clip(plan_m[..., None], 0.0, 1.0)
     out = plan_bgr.astype(np.float32) * alpha
-    return np.clip(out, 0, 255).astype(np.uint8)
+    return np.clip(out, 0, 255).astype(np.uint8), plan_m_u8
+
+
+def warp_segmentation_mask_topdown_bgr(
+    bgr: np.ndarray,
+    mask_hw: np.ndarray,
+    src_quad_tl_tr_br_bl: np.ndarray,
+    out_w: int,
+    out_h: int,
+) -> Optional[np.ndarray]:
+    """
+    Reproject the masked object to a top-down view and **auto-frame** it in the panel.
+
+    The green quad defines a single homography ``H`` (image → plan; see ``compute_table_topdown_homography``)
+    that is applied to the whole frame. The plan-space bounding box of the mask is then letterboxed (aspect
+    preserved) into ``out_w``×``out_h`` via an affine ``S``, and the frame is sampled with ``M = S @ H`` so
+    the object fills the panel wherever it sits relative to the calibration quad. RGB is kept only where the
+    warped mask is positive. ``mask_hw`` must match ``bgr`` size.
+    """
+    pair = warp_segmentation_mask_topdown_bgr_and_mask(
+        bgr, mask_hw, src_quad_tl_tr_br_bl, out_w, out_h
+    )
+    return None if pair is None else pair[0]
 
 
 def topdown_panel_message_bgr(out_w: int, out_h: int, lines: List[str]) -> np.ndarray:
@@ -688,6 +780,132 @@ class FrameSource(ABC):
         pass
 
 
+def _opencv_webcam_api(device: int | str) -> int:
+    """API preference for cv2.VideoCapture. V4L2 avoids long FFmpeg hangs on Linux /dev/video* paths."""
+    if sys.platform == "linux" and isinstance(device, str):
+        if device.strip().startswith("/dev/video"):
+            return int(cv2.CAP_V4L2)
+    return int(cv2.CAP_ANY)
+
+
+def _linux_video_candidates_from(preferred: str) -> List[str]:
+    """Ordered /dev/video* paths to try: preferred first, then n±1, n±2, … (existing nodes only)."""
+    preferred = preferred.strip()
+    m = re.match(r"^(/dev/video)(\d+)$", preferred)
+    if not m:
+        return [preferred]
+    prefix, num_s = m.groups()
+    n = int(num_s)
+    order: List[int] = [n]
+    seen_i = {n}
+    for step in range(1, 32):
+        for j in (n + step, n - step):
+            if j >= 0 and j not in seen_i:
+                seen_i.add(j)
+                order.append(j)
+    out: List[str] = []
+    seen_p = set()
+    for i in order:
+        p = f"{prefix}{i}"
+        if os.path.exists(p) and p not in seen_p:
+            seen_p.add(p)
+            out.append(p)
+    return out if out else [preferred]
+
+
+def _v4l2_quick_capture_ok(
+    dev: str,
+    width: int,
+    height: int,
+    buffer_size: int,
+) -> bool:
+    """Open with the same backend/settings as WebcamSource and confirm one read() succeeds."""
+    api = _opencv_webcam_api(dev)
+    cap = cv2.VideoCapture(dev, api)
+    if not cap.isOpened():
+        return False
+    try:
+        if width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        if height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        if buffer_size >= 0:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buffer_size))
+        ok, bgr = cap.read()
+        return bool(ok and bgr is not None and bgr.size > 0)
+    finally:
+        cap.release()
+
+
+def _resolve_linux_v4l2_device_for_capture(
+    preferred: str,
+    *,
+    width: int,
+    height: int,
+    buffer_size: int,
+) -> str:
+    """
+    Many UVC drivers register multiple device nodes per lens; only one accepts REQBUFS for video capture.
+    ``OpenCV.isOpened()`` can still be true on a metadata-only sibling — the first ``read()`` then fails.
+    """
+    preferred = preferred.strip()
+    if sys.platform != "linux" or not preferred.startswith("/dev/video"):
+        return preferred
+    candidates = _linux_video_candidates_from(preferred)
+    for cand in candidates:
+        if _v4l2_quick_capture_ok(cand, width, height, buffer_size):
+            if cand != preferred:
+                logging.warning(
+                    "V4L2 capture works on %s; %s did not return a frame (often a metadata/IR sibling of the "
+                    "same camera). Using %s. Disable with --webcam-fallback-siblings off.",
+                    cand,
+                    preferred,
+                    cand,
+                )
+            return cand
+    raise RuntimeError(
+        "Could not read a frame from any of these V4L2 devices (tried same settings as your CLI):\n  "
+        + "\n  ".join(candidates)
+        + "\nOther apps may be using the camera, or the requested resolution is unsupported. Try "
+        "`v4l2-ctl --list-devices`, `--webcam-width 0 --webcam-height 0`, or run with `--webcam-probe`."
+    )
+
+
+def _run_webcam_probe_table(width: int, height: int, buffer_size: int) -> None:
+    """Log which /dev/video* nodes accept a single V4L2 capture read (then exit from main)."""
+    paths = [p for p in glob.glob("/dev/video*") if re.match(r"^/dev/video\d+$", p)]
+
+    def sort_key(p: str) -> int:
+        m = re.search(r"(\d+)$", p)
+        return int(m.group(1)) if m else 0
+
+    paths.sort(key=sort_key)
+    if not paths:
+        logging.info("No /dev/video* devices found.")
+        return
+    logging.info("Probing /dev/video* (OpenCV + V4L2; width/height 0 = driver default)…")
+    for p in paths:
+        api = _opencv_webcam_api(p)
+        cap = cv2.VideoCapture(p, api)
+        if not cap.isOpened():
+            logging.info("  FAIL %s  (VideoCapture not opened)", p)
+            continue
+        try:
+            if width > 0:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+            if height > 0:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+            if buffer_size >= 0:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buffer_size))
+            ok, bgr = cap.read()
+            if ok and bgr is not None and bgr.size > 0:
+                logging.info("  OK   %s  frame_shape=%s", p, tuple(bgr.shape[:2]))
+            else:
+                logging.info("  FAIL %s  (empty read; wrong node or busy device)", p)
+        finally:
+            cap.release()
+
+
 class WebcamSource(FrameSource):
     """USB / UVC webcam. Requests low buffer by default to reduce motion blur from stale queued frames."""
 
@@ -701,7 +919,13 @@ class WebcamSource(FrameSource):
         flush_grabs: int = 0,
     ):
         self.flush_grabs = max(0, int(flush_grabs))
-        self.cap = cv2.VideoCapture(device)
+        api = _opencv_webcam_api(device)
+        logging.info(
+            "Opening webcam %r (OpenCV api=%s); if this hangs, wrong --webcam-device or busy device.",
+            device,
+            "CAP_V4L2" if api == int(cv2.CAP_V4L2) else "CAP_ANY",
+        )
+        self.cap = cv2.VideoCapture(device, api)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open webcam {device!r}")
         if width > 0:
@@ -809,11 +1033,19 @@ def build_frame_source(
     webcam_fps: float = 0.0,
     webcam_buffer_size: int = 1,
     webcam_flush_grabs: int = 0,
+    webcam_fallback_siblings: str = "on",
 ) -> FrameSource:
     if source == "webcam":
         dev: int | str = webcam_id
         if webcam_device is not None and webcam_device.strip():
             dev = webcam_device.strip()
+            if webcam_fallback_siblings == "on":
+                dev = _resolve_linux_v4l2_device_for_capture(
+                    dev,
+                    width=webcam_width,
+                    height=webcam_height,
+                    buffer_size=webcam_buffer_size,
+                )
         return WebcamSource(
             dev,
             width=webcam_width,
@@ -891,10 +1123,16 @@ class InteractiveSession:
     table_cal_clicks: List[Tuple[int, int]] = field(default_factory=list)
     table_topdown_src_quad: Optional[np.ndarray] = None  # (4,2) float32 when calibration succeeded
 
+    # Top-down outline: past image-plane masks (OR before warp) to mitigate occlusion / flicker.
+    topdown_outline_history_max: int = 0
+    topdown_outline_history: deque = field(init=False)
+
     def __post_init__(self) -> None:
         self._maybe_autocast = nullcontext()
         if self.device.type == "cuda":
             self._maybe_autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+        hm = int(self.topdown_outline_history_max)
+        self.topdown_outline_history = deque(maxlen=hm if hm > 0 else 1)
 
     def reset_table_topdown_cal(self) -> None:
         """Clear interactive table-plane clicks and homography (``t`` key when ``--top-down on``)."""
@@ -917,6 +1155,7 @@ class InteractiveSession:
         self._skip_iou_once = False
         self._stream_stability_ticks = 0
         self.stream_diag_prop_count = 0
+        self.topdown_outline_history.clear()
 
     def begin_reprompt(self) -> None:
         self.lock_state = LockState.NEED_CLICK
@@ -934,6 +1173,7 @@ class InteractiveSession:
         self._stream_stability_ticks = 0
         self.stream_video_state = None
         self.stream_diag_prop_count = 0
+        self.topdown_outline_history.clear()
 
     def reset_video_file_state(self, video_path: str) -> None:
         with torch.inference_mode(), self._maybe_autocast:
@@ -1116,6 +1356,7 @@ class InteractiveSession:
         self.candidate_masks = None
         self.candidate_scores = None
         self.anchor_mask = self.locked_mask.astype(bool).copy()
+        self.topdown_outline_history.clear()
         self._stream_stability_ticks = 0
         if event_only and source in ("webcam", "realsense"):
             lm = self.locked_mask.astype(bool)
@@ -1375,6 +1616,18 @@ def main() -> None:
         default=None,
         help="V4L2 device path, e.g. /dev/video2. Overrides --webcam-id. Only with --source webcam.",
     )
+    ap.add_argument(
+        "--webcam-fallback-siblings",
+        choices=("off", "on"),
+        default="on",
+        help="Linux + --webcam-device only: if that /dev/video node does not return frames (metadata/IR sibling is "
+        "common), try neighboring indices before failing. Default: on.",
+    )
+    ap.add_argument(
+        "--webcam-probe",
+        action="store_true",
+        help="Try each /dev/video* with V4L2 and log which return a test frame, then exit (before loading SAM2 checkpoints).",
+    )
     ap.add_argument("--webcam-fps", type=float, default=0.0, help="Optional CAP_PROP_FPS (0 = driver default).")
     ap.add_argument("--webcam-width", type=int, default=0, help="Optional capture width (0 = driver default).")
     ap.add_argument("--webcam-height", type=int, default=0, help="Optional capture height (0 = driver default).")
@@ -1440,8 +1693,91 @@ def main() -> None:
         help="off: right column lower half stays black. on: four clicks define the table quad (the homography "
         "template); the lower half shows the masked object reprojected top-down and auto-framed. t=reset.",
     )
+    ap.add_argument(
+        "--topdown-outline-history",
+        type=int,
+        default=0,
+        help="While TRACKING: merge this many past image-plane masks with the current mask before the top-down "
+        "warp (clipped to dilate(current) by default) to reduce gaps under brief occlusion (0 = disable, default).",
+    )
+    ap.add_argument(
+        "--topdown-outline-fuse-anchor",
+        action="store_true",
+        help="OR the lock-time anchor mask into the top-down fuse mask (default: anchor is not fused).",
+    )
+    ap.add_argument(
+        "--no-topdown-outline-fuse-clip",
+        action="store_true",
+        help="Fuse past/anchor with global OR (legacy). Default clips past/anchor to dilate(current) so moved "
+        "objects do not leave a ghost outline at the old pose.",
+    )
+    ap.add_argument(
+        "--topdown-outline-fuse-dilate-radius",
+        type=int,
+        default=0,
+        help="Dilation radius (px) for fusion clipping (0 = auto max(20, min(H,W)/10)). Increase if brief "
+        "occlusions are not filled; decrease if the outline bridges to nearby clutter.",
+    )
+    ap.add_argument(
+        "--no-topdown-outline-fuse-cc-filter",
+        action="store_true",
+        help="Disable post-fusion connected-component filter (blobs need not touch raw current pixels).",
+    )
+    ap.add_argument(
+        "--no-topdown-outline-history-prune",
+        action="store_true",
+        help="Use the full outline deque without IoU/centroid pruning before fusion.",
+    )
+    ap.add_argument(
+        "--topdown-outline-history-iou-min",
+        type=float,
+        default=0.02,
+        help="History prune: keep a past mask if IoU with current >= this OR centroid within max-px.",
+    )
+    ap.add_argument(
+        "--topdown-outline-history-max-centroid-px",
+        type=float,
+        default=0.0,
+        help="History prune: max centroid distance in px (0 = auto max(48, 0.25*min(H,W))).",
+    )
+    ap.add_argument(
+        "--topdown-outline-blur-sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma on the warped panel mask before contour extraction (0 = raw boundary).",
+    )
+    ap.add_argument(
+        "--topdown-outline-contour-smooth-sigma",
+        type=float,
+        default=12.0,
+        help="Contour vertex smoothing (0 = off). Default uses corner-aware straightening: long edges snap "
+        "to chords; arcs between corners use open Gaussian smoothing (see --no-topdown-outline-preserve-corners).",
+    )
+    ap.add_argument(
+        "--no-topdown-outline-preserve-corners",
+        action="store_true",
+        help="Use legacy circular Gaussian contour smoothing (rounds corners like a low-pass on vertex index).",
+    )
+    ap.add_argument(
+        "--topdown-outline-corner-angle-deg",
+        type=float,
+        default=45.0,
+        help="Preserve-corners mode: min turn angle (deg) to treat a vertex as a corner.",
+    )
+    ap.add_argument(
+        "--topdown-outline-edge-straighten-max-dev-px",
+        type=float,
+        default=10,
+        help="Preserve-corners mode: max deviation from chord (px) to replace a segment by a straight line.",
+    )
     ap.add_argument("--checkpoint", default="sam2_repo/checkpoints/sam2.1_hiera_large.pt")
     ap.add_argument("--model-cfg", default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    ap.add_argument(
+        "--device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Compute device (default: cuda). Falls back to cpu if cuda is unavailable.",
+    )
     args = ap.parse_args()
     if args.preview == "auto":
         args.preview = "live"
@@ -1452,10 +1788,18 @@ def main() -> None:
         if wd.startswith("/dev/") and not os.path.exists(wd):
             logging.warning("webcam path does not exist (yet): %s", wd)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+    if args.webcam_probe:
+        if args.source != "webcam":
+            ap.error("--webcam-probe is only valid with --source webcam")
+        _run_webcam_probe_table(args.webcam_width, args.webcam_height, args.webcam_buffer)
+        return
+
+    if args.device == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            logging.warning("cuda requested but not available; falling back to cpu")
+            device = torch.device("cpu")
     else:
         device = torch.device("cpu")
     logging.info("device=%s", device)
@@ -1482,6 +1826,7 @@ def main() -> None:
         webcam_fps=args.webcam_fps,
         webcam_buffer_size=args.webcam_buffer,
         webcam_flush_grabs=args.webcam_flush_grabs,
+        webcam_fallback_siblings=args.webcam_fallback_siblings,
     )
 
     session = InteractiveSession(
@@ -1492,6 +1837,7 @@ def main() -> None:
         source_kind=args.source,
         stream_video_state_cap=args.stream_video_state_cap,
         stream_diag_every=args.stream_diag_every,
+        topdown_outline_history_max=args.topdown_outline_history,
     )
     if args.stream_diag_every > 0 and args.source in ("webcam", "realsense"):
         logging.info(
@@ -1744,13 +2090,67 @@ def main() -> None:
                     upper_panel_bgr = oriented_min_area_rect_mask_patch_bgr(
                         bgr, mask_draw, strip_w, ph_top
                     )
-                    lower_panel_bgr = warp_segmentation_mask_topdown_bgr(
-                        bgr,
+                    fuse_anchor = args.topdown_outline_fuse_anchor
+                    past_td = (
+                        list(session.topdown_outline_history)
+                        if args.topdown_outline_history > 0
+                        and session.lock_state == LockState.TRACKING
+                        else []
+                    )
+                    if (
+                        past_td
+                        and not args.no_topdown_outline_history_prune
+                        and (mask_draw > 0).any()
+                    ):
+                        past_td = prune_outline_history_masks(
+                            past_td,
+                            mask_draw,
+                            h,
+                            w,
+                            iou_min=args.topdown_outline_history_iou_min,
+                            max_centroid_px=args.topdown_outline_history_max_centroid_px,
+                        )
+                    mask_td = fuse_outline_masks_image_plane(
                         mask_draw,
+                        past_td,
+                        session.anchor_mask if fuse_anchor else None,
+                        out_h=h,
+                        out_w=w,
+                        fuse_anchor=fuse_anchor,
+                        clip_past_and_anchor_to_dilated_current=not args.no_topdown_outline_fuse_clip,
+                        fusion_dilate_radius_px=args.topdown_outline_fuse_dilate_radius,
+                        cc_filter_touching_current=not args.no_topdown_outline_fuse_cc_filter,
+                    )
+                    pair_td = warp_segmentation_mask_topdown_bgr_and_mask(
+                        bgr,
+                        mask_td,
                         q,
                         strip_w,
                         ph_bot,
                     )
+                    if pair_td is not None:
+                        lower_panel_bgr, _plan_mask_u8 = pair_td
+                        lower_panel_bgr = draw_outline_overlay_bgr(
+                            lower_panel_bgr,
+                            outline_from_topdown_mask(
+                                _plan_mask_u8,
+                                boundary_blur_sigma=args.topdown_outline_blur_sigma,
+                                contour_smooth_sigma_pts=args.topdown_outline_contour_smooth_sigma,
+                                contour_preserve_straight_edges=not args.no_topdown_outline_preserve_corners,
+                                contour_corner_angle_deg=args.topdown_outline_corner_angle_deg,
+                                edge_straighten_max_dev_px=args.topdown_outline_edge_straighten_max_dev_px,
+                            ),
+                        )
+                    else:
+                        lower_panel_bgr = None
+                    if (
+                        args.topdown_outline_history > 0
+                        and session.lock_state == LockState.TRACKING
+                        and (mask_draw > 0).any()
+                    ):
+                        session.topdown_outline_history.append(
+                            mask_to_shape_hw(mask_draw, h, w).astype(bool).copy()
+                        )
                     if lower_panel_bgr is None or int(lower_panel_bgr.sum()) == 0:
                         lower_panel_bgr = topdown_panel_message_bgr(
                             strip_w,
